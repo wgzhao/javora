@@ -6,20 +6,27 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.json.simple.JSONObject;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.StringJoiner;
 
 public class OracleMonitor
 {
 
     private static final Map<String, String> oracleMonitorSql = new HashMap<>();
+
+    private static Boolean isVerbose = false;
 
     static {
         // count of active users
@@ -198,11 +205,31 @@ public class OracleMonitor
                 "              = en.name and en.name = 'latch free'");
 
         // List tablespace names in a JSON like format for Zabbix use
-        oracleMonitorSql.put("show_tablespaces", "SELECT tablespace_name FROM dba_tablespaces ORDER BY 1");
+        // output:
+        // {
+        //     "data":[
+        //     { "{#TABLESPACE}":"ORASDPM"},
+        //     { "{#TABLESPACE}":"MDS"},
+        //     { "{#TABLESPACE}":"SOADEV_MDS"},
+        //     { "{#TABLESPACE}":"ORABAM"},
+        //     { "{#TABLESPACE}":"SOAINF"},
+        //     { "{#TABLESPACE}":"DATA"},
+        //     { "{#TABLESPACE}":"MGMT_AD4J_TS"},
+        //     { "{#TABLESPACE}":"MGMT_ECM_DEPOT_TS"},
+        //     { "{#TABLESPACE}":"MGMT_TABLESPACE"},
+        //     { "{#TABLESPACE}":"RECOVER"},
+        //     { "{#TABLESPACE}":"RMAN_CAT"},
+        //     { "{#TABLESPACE}":"SYSAUX"},
+        //     { "{#TABLESPACE}":"SYSTEM"},
+        //     { "{#TABLESPACE}":"TEMP"},
+        //     { "{#TABLESPACE}":"UNDOTBS"},
+        //     { "{#TABLESPACE}":"VIRTUALCENTER"},
+        //     ]
+        // }
+        oracleMonitorSql.put("show_tablespaces", "SELECT tablespace_name FROM dba_tablespaces order by 1");
 
         // List temporary tablespace names in a JSON like format for Zabbix use
-        oracleMonitorSql.put("show_tablespace_temp", "SELECT TABLESPACE_NAME FROM DBA_TABLESPACES WHERE " +
-                "              CONTENTS='TEMPORARY'");
+        oracleMonitorSql.put("show_tablespace_temp", "SELECT TABLESPACE_NAME FROM DBA_TABLESPACES WHERE CONTENTS='TEMPORARY'");
 
         // List als ASM volumes in a JSON like format for Zabbix use
         oracleMonitorSql.put("show_asm_volumes", "select NAME from v$asm_diskgroup_stat ORDER BY 1");
@@ -218,18 +245,51 @@ public class OracleMonitor
                 "              gv$transaction t,gv$session s where ses_addr = saddr");
 
         // Query session
-        oracleMonitorSql.put("query_sessions", "select count(*) from gv$session where username is not null " +
-                "              and status='ACTIVE'");
+        oracleMonitorSql.put("query_sessions", "select count(*) from gv$session where username is not null and status='ACTIVE'");
 
         // Query the Fast Recovery Area usage
-        oracleMonitorSql.put("fra_use", "elect round((SPACE_LIMIT-(SPACE_LIMIT-SPACE_USED))/ " +
-                "              SPACE_LIMIT*100,2) FROM V$RECOVERY_FILE_DEST");
+        oracleMonitorSql.put("fra_use", "select round((SPACE_LIMIT-(SPACE_LIMIT-SPACE_USED))/SPACE_LIMIT*100,2) FROM V$RECOVERY_FILE_DEST");
 
         // Query the list of users on the instance
         oracleMonitorSql.put("show_users", "SELECT username FROM dba_users ORDER BY 1");
+
+        // Get table space in usage
+        oracleMonitorSql.put("tablespace", "SELECT 100-(TRUNC((max_free_mb/max_size_mb) * 100)) AS USED " +
+                "  FROM ( SELECT a.tablespace_name,b.size_mb,a.free_mb,b.max_size_mb,a.free_mb + (b.max_size_mb - b.size_mb) AS max_free_mb" +
+                "  FROM   (SELECT tablespace_name,TRUNC(SUM(bytes)/1024/1024) AS free_mb FROM dba_free_space GROUP BY tablespace_name) a," +
+                "  (SELECT tablespace_name,TRUNC(SUM(bytes)/1024/1024) AS size_mb,TRUNC(SUM(GREATEST(bytes,maxbytes))/1024/1024) AS max_size_mb" +
+                "  FROM   dba_data_files GROUP BY tablespace_name) b WHERE  a.tablespace_name = b.tablespace_name" +
+                "  ) where tablespace_name='%s'");
+
+        // Get tablespace in use, pass tablespace name
+        oracleMonitorSql.put("tablespace_abs", "SELECT (df.totalspace -  tu.totalusedspace) AS FREEMB from (select tablespace_name, " +
+                "  sum(bytes) TotalSpace from dba_data_files group by tablespace_name)  df ," +
+                " (select sum(bytes) totalusedspace,tablespace_name from dba_segments " +
+                "  group by tablespace_name) tu WHERE tu.tablespace_name = df.tablespace_name and df.tablespace_name = '%s' ");
+
+        // List archive used
+        oracleMonitorSql.put("check_archive", "select trunc((total_mb-free_mb)*100/(total_mb)) PCT from v$asm_diskgroup_stat where name='%s'");
+
+        // Query temporary tablespaces, pass tablespace name
+        oracleMonitorSql.put("tablespace_temp", "SELECT round(((TABLESPACE_SIZE-FREE_SPACE)/TABLESPACE_SIZE)*100,2) " +
+                "              PERCENTUAL FROM dba_temp_free_space where  tablespace_name='%s'");
+
+        // Query v$sysmetric parameters, pass metric name
+        oracleMonitorSql.put("query_sysmetrics", "select value from v$sysmetric where METRIC_NAME ='{name.replace(\"_\", \" \")}' and rownum <=1");
+
+        // Get ASM volume usage
+        oracleMonitorSql.put("asm_volume_use", "select round(((TOTAL_MB-FREE_MB)/TOTAL_MB*100),2) from " +
+                "              v$asm_diskgroup_stat where name = '%s'");
+
+        // Determines whether a user is locked or not, pass username
+        oracleMonitorSql.put("user_status", "SELECT account_status FROM dba_users WHERE username='%s'");
     }
 
-    private static void oracleMonitor(String url, String username, String password, String kind)
+    private static final List<String> needParams = Arrays.asList("tablespace", "check_archive", "tablespace_temp", "tablespace_abs",
+            "user_status", "asm_volume_use");
+    private static final List<String> needJson = Arrays.asList("show_tablespaces", "show_tablespace_temp", "show_asm_volumes");
+
+    private static void oracleMonitor(String url, String username, String password, String kind, String... param)
     {
         Connection connection;
         Statement statement;
@@ -239,7 +299,27 @@ public class OracleMonitor
             statement = connection.createStatement();
 
             if (oracleMonitorSql.containsKey(kind)) {
-                ResultSet resultSet = statement.executeQuery(oracleMonitorSql.get(kind));
+                String sql = oracleMonitorSql.get(kind);
+                // some sql need argument
+                if (needParams.contains(kind)) {
+                    sql = String.format(sql, param[0]);
+                }
+                if (isVerbose) {
+                    System.out.println("query sql is : " + sql);
+                }
+                ResultSet resultSet = statement.executeQuery(sql);
+                if (needJson.contains(kind)) {
+                    JSONObject object = new JSONObject();
+
+                    List<Map<String, String>> res = new ArrayList<>();
+                    while (resultSet.next()) {
+                        Map<String, String> map = new HashMap<>();
+                        map.put("{#TABLESPACE}", resultSet.getString(1));
+                        res.add(map);
+                    }
+                    object.put("data", res);
+                    System.out.println(object.toJSONString());
+                }
                 while (resultSet.next()) {
                     System.out.println(resultSet.getString(1));
                 }
@@ -281,11 +361,15 @@ public class OracleMonitor
         options.addOption(new Option("P", "port", true, "listen port"));
         options.addOption(new Option("d", "database", true, "oracle SID or database"));
         options.addOption(new Option("k", "kind", true, "which check you want to do"));
+        Option opt = new Option("v", "verbose", false, "more output for debug");
+        opt.setRequired(false);
+        options.addOption(opt);
         CommandLineParser parser = new DefaultParser();
         CommandLine cmd = null;
         try {
             cmd = parser.parse(options, args);
-        }  catch (ParseException e) {
+        }
+        catch (ParseException e) {
             System.out.println("0");
             System.out.println(e.getMessage());
         }
@@ -309,7 +393,21 @@ public class OracleMonitor
             kind = cmd.getOptionValue("k");
         }
 
+        if (cmd.hasOption("v")) {
+            isVerbose = true;
+        }
+
         String url = "jdbc:oracle:thin:@" + host + ":" + port + "/" + database;
-        oracleMonitor(url, username, password, kind);
+        if (needParams.contains(kind)) {
+            if (cmd.getArgs().length < 1) {
+                System.out.println("0");
+                System.out.println("the kind " + kind + " need a argument");
+                return;
+            }
+            oracleMonitor(url, username, password, kind, cmd.getArgs()[0]);
+        }
+        else {
+            oracleMonitor(url, username, password, kind);
+        }
     }
 }
